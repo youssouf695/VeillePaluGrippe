@@ -15,7 +15,6 @@ app.use(express.json());
 /* =============================
    RSS DETECTION FUNCTION
 ============================= */
-
 async function detectRSS(url) {
   try {
     await parser.parseURL(url);
@@ -24,15 +23,11 @@ async function detectRSS(url) {
     try {
       const { data } = await axios.get(url);
       const $ = cheerio.load(data);
-
       const rssLink =
         $('link[type="application/rss+xml"]').attr("href") ||
         $('link[type="application/atom+xml"]').attr("href");
-
       if (!rssLink) return null;
-
       if (rssLink.startsWith("http")) return rssLink;
-
       return new URL(rssLink, url).href;
     } catch {
       return null;
@@ -40,10 +35,82 @@ async function detectRSS(url) {
   }
 }
 
+/* =============================
+   WHITELIST THÈMES
+============================= */
+const ALLOWED_THEMES = [
+  // PALUDISME
+  "paludisme", "malaria", "plasmodium", "anophèle", "anophele", "moustique",
+  "artemisinine", "artémisinine", "chloroquine", "quinine", "antipaludique",
+  "moustiquaire", "parasitemie", "parasitémie", "splenomegalie", "splénomégalie",
+  "transmission", "vecteur", "endémie", "endemie", "fièvre", "fievre",
+  // GRIPPE
+  "grippe", "influenza", "h1n1", "h3n2", "h5n1", "h5n2",
+  "vaccination", "vaccin", "antigène", "antigene", "anticorps",
+  "immunite", "immunité", "pandemie", "pandémie", "antiviral", "antiviraux",
+  "pneumonie", "toux", "courbature",
+  // GÉNÉRAL SANTÉ
+  "epidemie", "épidémie", "epidemiologie", "épidémiologie", "surveillance",
+  "pathogene", "pathogène", "diagnostic", "depistage", "dépistage",
+  "incidence", "prevalence", "prévalence", "contagion", "quarantaine",
+  "symptome", "symptôme", "traitement", "prevention", "prévention",
+  "mortalite", "mortalité", "morbidite", "morbidité", "sante", "santé",
+  "oms", "who", "cas", "contamination", "infection", "infectieux",
+];
 
-// Timestamp du dernier scan
+function isThemeAllowed(name) {
+  const normalized = name.trim().toLowerCase();
+  return ALLOWED_THEMES.some(
+    (t) => normalized.includes(t) || t.includes(normalized)
+  );
+}
+
+/* =============================
+   WHITELIST DOMAINES FLUX
+============================= */
+const ALLOWED_DOMAINS = [
+  "who.int", "santepubliquefrance.fr", "pubmed.ncbi.nlm.nih.gov",
+  "cidrap.umn.edu", "cdc.gov", "pasteur.fr", "inserm.fr",
+  "ecdc.europa.eu", "afro.who.int", "rfi.fr", "sante.gouv.fr",
+  "rollbackmalaria.org", "onlinelibrary.wiley.com",
+  "thelancet.com", "nejm.org", "bmj.com", "nature.com",
+  "sciencedirect.com", "ncbi.nlm.nih.gov", "eurosurveillance.org",
+];
+
+const HEALTH_KEYWORDS = [
+  "malaria", "paludisme", "grippe", "influenza", "health", "santé", "sante",
+  "disease", "virus", "epidemic", "pandemic", "vaccine", "médical", "medical",
+  "patient", "symptom", "treatment", "hospital", "clinical", "pathogen",
+  "epidemiology", "épidémiologie", "morbidity", "mortality",
+];
+
+function isDomainAllowed(url) {
+  try {
+    const hostname = new URL(url).hostname.replace("www.", "");
+    return ALLOWED_DOMAINS.some((d) => hostname.includes(d));
+  } catch { return false; }
+}
+
+async function isContentHealthRelated(rssUrl) {
+  try {
+    const { data } = await axios.get(
+      `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}&count=5`
+    );
+    if (!data.items || data.items.length === 0) return false;
+    const text = data.items
+      .map((i) => `${i.title} ${i.description || ""}`)
+      .join(" ")
+      .toLowerCase();
+    const matches = HEALTH_KEYWORDS.filter((kw) => text.includes(kw));
+    return matches.length >= 2;
+  } catch { return false; }
+}
+
+/* =============================
+   SCAN RSS
+============================= */
 let lastScanTime = new Date();
-// Fonction de scan RSS
+
 async function scanFeeds() {
   console.log("-----------------------------");
   console.log("-- 🔄 Scan des sources RSS... ");
@@ -77,15 +144,8 @@ async function scanFeeds() {
 
           if (insertArticle.rows.length > 0) {
             const article = insertArticle.rows[0];
-
-            // 🔎 Matching avec thèmes
             for (const theme of themes) {
-              const text = (
-                article.title +
-                " " +
-                article.content
-              ).toLowerCase();
-
+              const text = (article.title + " " + article.content).toLowerCase();
               if (text.includes(theme.name.toLowerCase())) {
                 await pool.query(
                   `INSERT INTO article_themes (article_id, theme_id)
@@ -96,28 +156,24 @@ async function scanFeeds() {
               }
             }
           }
-        } catch (err) {
-          continue;
-        }
+        } catch { continue; }
       }
-    } catch (err) {
+    } catch {
       console.log("❌ Feed error:", feed.url);
     }
   }
+
   lastScanTime = new Date();
   console.log("-----------------------------");
   console.log("---     Scan finished     ---");
   console.log("-----------------------------");
 }
 
-
-
-// ============================= THEMES/ Keywords/ Mots-clés =========================
-
+/* =============================
+   THEMES
+============================= */
 app.get("/themes", async (req, res) => {
-  const result = await pool.query(
-    "SELECT * FROM themes ORDER BY categorie, name"
-  );
+  const result = await pool.query("SELECT * FROM themes ORDER BY categorie, name");
   res.json(result.rows);
 });
 
@@ -125,7 +181,14 @@ app.post("/themes", async (req, res) => {
   const { name, categorie } = req.body;
 
   if (!["PALUDISME", "GRIPPE"].includes(categorie)) {
-    return res.status(400).json({ error: "Invalid category" });
+    return res.status(400).json({ error: "Catégorie invalide" });
+  }
+
+  // Validation whitelist
+  if (!isThemeAllowed(name)) {
+    return res.status(400).json({
+      error: `"${name}" n'est pas reconnu comme terme médical lié au paludisme ou à la grippe.`,
+    });
   }
 
   try {
@@ -135,7 +198,7 @@ app.post("/themes", async (req, res) => {
     );
     res.json(result.rows[0]);
   } catch {
-    res.status(400).json({ error: "Theme already exists" });
+    res.status(400).json({ error: "Ce thème existe déjà" });
   }
 });
 
@@ -144,27 +207,39 @@ app.delete("/themes/:id", async (req, res) => {
   res.json({ message: "Deleted" });
 });
 
-/* ============================= FEEDS / flux ============================= */
-
+/* =============================
+   FEEDS
+============================= */
 app.get("/feeds", async (req, res) => {
   const result = await pool.query("SELECT * FROM feeds ORDER BY id DESC");
   res.json(result.rows);
 });
 
 app.post("/feeds", async (req, res) => {
-  const { url, name } = req.body;  // ← ajouter name
+  const { url, name } = req.body;
 
   const rssUrl = await detectRSS(url);
-  if (!rssUrl) return res.status(400).json({ error: "No RSS feed found" });
+  if (!rssUrl) return res.status(400).json({ error: "Aucun flux RSS trouvé" });
+
+  // 1. Domaine whitelisté → accepté directement
+  // 2. Domaine inconnu → valider le contenu
+  if (!isDomainAllowed(rssUrl)) {
+    const isHealth = await isContentHealthRelated(rssUrl);
+    if (!isHealth) {
+      return res.status(400).json({
+        error: "Ce flux ne semble pas lié à la santé. Seules les sources médicales sont autorisées.",
+      });
+    }
+  }
 
   try {
     const result = await pool.query(
-      "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",  // ← ajouter name
+      "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
       [rssUrl, name || null]
     );
     res.json(result.rows[0]);
   } catch {
-    res.status(400).json({ error: "Feed already exists" });
+    res.status(400).json({ error: "Ce flux existe déjà" });
   }
 });
 
@@ -173,8 +248,9 @@ app.delete("/feeds/:id", async (req, res) => {
   res.json({ message: "Deleted" });
 });
 
-// ============================= THEMES ACTIFS / Active Themes =============================
-// Récupérer les thèmes actifs
+/* =============================
+   ACTIVE THEMES
+============================= */
 app.get("/active-themes", async (req, res) => {
   const result = await pool.query(`
     SELECT t.* FROM themes t
@@ -183,7 +259,6 @@ app.get("/active-themes", async (req, res) => {
   res.json(result.rows);
 });
 
-// Activer un thème
 app.post("/active-themes", async (req, res) => {
   const { theme_id } = req.body;
   try {
@@ -197,18 +272,17 @@ app.post("/active-themes", async (req, res) => {
   }
 });
 
-// Désactiver un thème
 app.delete("/active-themes/:theme_id", async (req, res) => {
   await pool.query("DELETE FROM active_themes WHERE theme_id = $1", [req.params.theme_id]);
   res.json({ message: "Désactivé" });
 });
 
-// =============== endpoint pour récupérer les articles avec l'URL du feed ====================
-
-// Aller chercher les 100 derniers articles avec l'URL du feed associé
+/* =============================
+   ARTICLES
+============================= */
 app.get("/articles/active", async (req, res) => {
   const result = await pool.query(`
-    SELECT DISTINCT a.*, f.url AS feed_url
+    SELECT DISTINCT a.*, f.url AS feed_url, f.name AS source
     FROM articles a
     JOIN feeds f ON a.feed_id = f.id
     JOIN article_themes art ON a.id = art.article_id
@@ -219,25 +293,21 @@ app.get("/articles/active", async (req, res) => {
   res.json(result.rows);
 });
 
-// Récupérer les articles associés à un thème
 app.get("/articles/theme/:id", async (req, res) => {
   const result = await pool.query(`
-    SELECT a.*
-    FROM articles a
-    JOIN article_themes at ON a.id = at.article_id
-    WHERE at.theme_id = $1
+    SELECT a.* FROM articles a
+    JOIN article_themes art ON a.id = art.article_id
+    WHERE art.theme_id = $1
     ORDER BY a.pub_date DESC
   `, [req.params.id]);
-
   res.json(result.rows);
 });
 
-// Nouveaux articles depuis le dernier chargement
 app.get("/articles/new", async (req, res) => {
   const { since } = req.query;
   try {
     const result = await pool.query(`
-      SELECT DISTINCT a.*, f.url AS feed_url
+      SELECT DISTINCT a.*, f.url AS feed_url, f.name AS source
       FROM articles a
       JOIN feeds f ON a.feed_id = f.id
       JOIN article_themes art ON a.id = art.article_id
@@ -246,14 +316,14 @@ app.get("/articles/new", async (req, res) => {
       ORDER BY a.pub_date DESC
     `, [since || new Date(Date.now() - 60 * 60 * 1000)]);
     res.json(result.rows);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-
-//============================ ARTICLES SAUVEGARDÉS =============================
-// Sauvegarder un article
+/* =============================
+   SAVED ARTICLES
+============================= */
 app.post("/saved", async (req, res) => {
   const { title, link, description, source, pub_date } = req.body;
   try {
@@ -270,38 +340,26 @@ app.post("/saved", async (req, res) => {
   }
 });
 
-// Récupérer les articles sauvegardés
 app.get("/saved", async (req, res) => {
   const result = await pool.query("SELECT * FROM saved_articles ORDER BY saved_at DESC");
   res.json(result.rows);
 });
 
-// Supprimer un article sauvegardé
 app.delete("/saved/:id", async (req, res) => {
   await pool.query("DELETE FROM saved_articles WHERE id = $1", [req.params.id]);
   res.json({ message: "Supprimé" });
 });
 
-
+/* =============================
+   START
+============================= */
 app.listen(PORT, "0.0.0.0", () => {
   console.log("----------------------------------------------");
   console.log("--                                          --");
-  console.log("--                                          --");
   console.log(`--     Server running on port ${PORT}          --`);
   console.log("--                                          --");
-  console.log("--                                          --"); 
   console.log("----------------------------------------------");
 });
 
-
-
-
-
-
-//pour scanner automatiquement les flux toutes les 10 minutes
-setInterval(() => {
-  scanFeeds();
-}, 10 * 60 * 1000);
-
-//lancer un scan au démarrage du serveur
+setInterval(() => { scanFeeds(); }, 10 * 60 * 1000);
 scanFeeds();
