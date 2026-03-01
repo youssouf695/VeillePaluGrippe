@@ -388,13 +388,13 @@ app.post("/feeds", authMiddleware, async (req, res) => {
 
   // Contenu ok mais domaine inconnu → pending
   try {
-    await pool.query(
-      "INSERT INTO pending_feeds (url, name, submitted_by) VALUES ($1, $2, $3)",
-      [rssUrl, name || null, req.user.id]
+    const result = await pool.query(
+      "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
+      [rssUrl, name || null]
     );
-    res.json({ message: "Flux soumis pour validation par un administrateur.", pending: true });
+    return res.json(result.rows[0]);
   } catch {
-    res.status(400).json({ error: "Ce flux est déjà en attente de validation" });
+    return res.status(400).json({ error: "Ce flux existe déjà" });
   }
 });
 
