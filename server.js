@@ -128,6 +128,7 @@ async function isContentHealthRelated(rssUrl) {
 
 /* =============================
    SCAN RSS
+   Scanne les flux globaux (admin) ET les flux personnels (users)
 ============================= */
 let lastScanTime = new Date();
 
@@ -136,12 +137,16 @@ async function scanFeeds() {
   console.log("-- 🔄 Scan des sources RSS...");
   console.log("-----------------------------");
 
-  const feedsResult = await pool.query("SELECT * FROM feeds");
-  const themesResult = await pool.query("SELECT * FROM themes");
-  const feeds = feedsResult.rows;
+  const [feedsResult, userFeedsResult, themesResult] = await Promise.all([
+    pool.query("SELECT * FROM feeds"),
+    pool.query("SELECT * FROM user_feeds"),
+    pool.query("SELECT * FROM themes"),
+  ]);
+
   const themes = themesResult.rows;
 
-  for (const feed of feeds) {
+  // Scanne les flux globaux
+  for (const feed of feedsResult.rows) {
     try {
       const parsed = await parser.parseURL(feed.url);
       for (const item of parsed.items) {
@@ -168,7 +173,38 @@ async function scanFeeds() {
           }
         } catch { continue; }
       }
-    } catch { console.log("❌ Feed error:", feed.url); }
+    } catch { console.log("❌ Global feed error:", feed.url); }
+  }
+
+  // Scanne les flux personnels
+  for (const feed of userFeedsResult.rows) {
+    try {
+      const parsed = await parser.parseURL(feed.url);
+      for (const item of parsed.items) {
+        try {
+          const insertArticle = await pool.query(
+            `INSERT INTO user_articles (user_feed_id, title, link, content, pub_date)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (link) DO NOTHING RETURNING *`,
+            [feed.id, item.title || "", item.link,
+             item.contentSnippet || item.content || "",
+             item.pubDate ? new Date(item.pubDate) : null]
+          );
+          if (insertArticle.rows.length > 0) {
+            const article = insertArticle.rows[0];
+            for (const theme of themes) {
+              const text = (article.title + " " + article.content).toLowerCase();
+              if (text.includes(theme.name.toLowerCase())) {
+                await pool.query(
+                  `INSERT INTO user_article_themes (article_id, theme_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                  [article.id, theme.id]
+                );
+              }
+            }
+          }
+        } catch { continue; }
+      }
+    } catch { console.log("❌ User feed error:", feed.url); }
   }
 
   lastScanTime = new Date();
@@ -287,7 +323,6 @@ app.delete("/themes/personal/:id", authMiddleware, async (req, res) => {
   res.json({ message: "Supprimé" });
 });
 
-// Tous les thèmes (globaux + perso)
 app.get("/themes/all", authMiddleware, async (req, res) => {
   const global = await pool.query("SELECT *, 'global' as type FROM themes ORDER BY categorie, name");
   const personal = await pool.query(
@@ -298,19 +333,29 @@ app.get("/themes/all", authMiddleware, async (req, res) => {
 });
 
 /* =============================
-   ACTIVE THEMES (par user)
+   ACTIVE THEMES — STRICTEMENT ISOLÉS PAR USER
+   La table user_active_themes filtre toujours par user_id
+   => thèmes actifs de user A jamais visibles par user B
 ============================= */
 app.get("/active-themes", authMiddleware, async (req, res) => {
+  // Thèmes globaux actifs POUR CE USER UNIQUEMENT
   const global = await pool.query(`
-    SELECT t.*, 'global' as type FROM themes t
+    SELECT t.*, 'global' as type
+    FROM themes t
     JOIN user_active_themes uat ON t.id = uat.theme_id
-    WHERE uat.user_id = $1 AND uat.theme_id IS NOT NULL
+    WHERE uat.user_id = $1
+      AND uat.theme_id IS NOT NULL
   `, [req.user.id]);
 
+  // Thèmes personnels actifs POUR CE USER UNIQUEMENT
+  // Double vérification : uat.user_id = $1 ET ut.user_id = $1
   const personal = await pool.query(`
-    SELECT ut.*, 'personal' as type FROM user_themes ut
+    SELECT ut.*, 'personal' as type
+    FROM user_themes ut
     JOIN user_active_themes uat ON ut.id = uat.user_theme_id
-    WHERE uat.user_id = $1 AND uat.user_theme_id IS NOT NULL
+    WHERE uat.user_id = $1
+      AND uat.user_theme_id IS NOT NULL
+      AND ut.user_id = $1
   `, [req.user.id]);
 
   res.json([...global.rows, ...personal.rows]);
@@ -318,78 +363,55 @@ app.get("/active-themes", authMiddleware, async (req, res) => {
 
 app.post("/active-themes", authMiddleware, async (req, res) => {
   const { theme_id, user_theme_id } = req.body;
+
+  // Sécurité : le thème personnel doit appartenir à ce user
+  if (user_theme_id) {
+    const check = await pool.query(
+      "SELECT id FROM user_themes WHERE id = $1 AND user_id = $2",
+      [user_theme_id, req.user.id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(403).json({ error: "Ce thème ne vous appartient pas" });
+    }
+  }
+
   try {
     await pool.query(
       `INSERT INTO user_active_themes (user_id, theme_id, user_theme_id)
-       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+       VALUES ($1, $2, $3)
+       ON CONFLICT DO NOTHING`,
       [req.user.id, theme_id || null, user_theme_id || null]
     );
     res.json({ message: "Activé" });
   } catch {
-    res.status(400).json({ error: "Erreur" });
+    res.status(400).json({ error: "Erreur lors de l'activation" });
   }
 });
 
 app.delete("/active-themes/:theme_id", authMiddleware, async (req, res) => {
+  // WHERE user_id = $1 garantit que seule la ligne de CE user est supprimée
   await pool.query(
-    "DELETE FROM user_active_themes WHERE user_id = $1 AND (theme_id = $2 OR user_theme_id = $2)",
+    `DELETE FROM user_active_themes
+     WHERE user_id = $1
+       AND (theme_id = $2 OR user_theme_id = $2)`,
     [req.user.id, req.params.theme_id]
   );
   res.json({ message: "Désactivé" });
 });
 
 /* =============================
-   FEEDS
+   FLUX GLOBAUX (admin uniquement)
+   Visibles par TOUS les users en lecture
 ============================= */
-app.get("/feeds", authMiddleware, async (req, res) => {
-  const result = await pool.query(
-    "SELECT * FROM feeds WHERE user_id = $1 ORDER BY id DESC",
-    [req.user.id]
-  );
+app.get("/feeds", async (req, res) => {
+  const result = await pool.query("SELECT * FROM feeds ORDER BY id DESC");
   res.json(result.rows);
 });
 
-// User soumet un flux → va dans pending
-app.post("/feeds", authMiddleware, async (req, res) => {
+app.post("/feeds", authMiddleware, adminMiddleware, async (req, res) => {
   const { url, name } = req.body;
   const rssUrl = await detectRSS(url);
   if (!rssUrl) return res.status(400).json({ error: "Aucun flux RSS trouvé" });
-
-  // Si admin → ajout direct
-  if (req.user.role === "admin") {
-    try {
-      const result = await pool.query(
-        "INSERT INTO feeds (url, name, user_id) VALUES ($1, $2, $3) RETURNING *",
-        [rssUrl, name || null, req.user.id]
-      );
-      return res.json(result.rows[0]);
-    } catch {
-      return res.status(400).json({ error: "Ce flux existe déjà" });
-    }
-  }
-
-  // Si domaine whitelisté → ajout direct
-  if (await isDomainAllowed(rssUrl)) {
-    try {
-      const result = await pool.query(
-        "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
-        [rssUrl, name || null]
-      );
-      return res.json(result.rows[0]);
-    } catch {
-      return res.status(400).json({ error: "Ce flux existe déjà" });
-    }
-  }
-
-  // Sinon → validation contenu puis pending
-  const isHealth = await isContentHealthRelated(rssUrl);
-  if (!isHealth) {
-    return res.status(400).json({
-      error: "Ce flux ne semble pas lié à la santé. Seules les sources médicales sont autorisées.",
-    });
-  }
-
-  // Contenu ok mais domaine inconnu → pending
   try {
     const result = await pool.query(
       "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
@@ -407,35 +429,137 @@ app.delete("/feeds/:id", authMiddleware, adminMiddleware, async (req, res) => {
 });
 
 /* =============================
+   FLUX PERSONNELS (users)
+   Chaque user voit et gère UNIQUEMENT ses propres flux
+   Table : user_feeds (id, user_id, url, name, created_at)
+============================= */
+app.get("/user-feeds", authMiddleware, async (req, res) => {
+  const result = await pool.query(
+    "SELECT * FROM user_feeds WHERE user_id = $1 ORDER BY id DESC",
+    [req.user.id]
+  );
+  res.json(result.rows);
+});
+
+app.post("/user-feeds", authMiddleware, async (req, res) => {
+  const { url, name } = req.body;
+
+  const rssUrl = await detectRSS(url);
+  if (!rssUrl) return res.status(400).json({ error: "Aucun flux RSS trouvé" });
+
+  // Domaine whitelisté → ajout direct
+  if (await isDomainAllowed(rssUrl)) {
+    try {
+      const result = await pool.query(
+        "INSERT INTO user_feeds (user_id, url, name) VALUES ($1, $2, $3) RETURNING *",
+        [req.user.id, rssUrl, name || null]
+      );
+      return res.json(result.rows[0]);
+    } catch {
+      return res.status(400).json({ error: "Ce flux existe déjà dans vos sources" });
+    }
+  }
+
+  // Domaine inconnu → vérification contenu santé
+  const isHealth = await isContentHealthRelated(rssUrl);
+  if (!isHealth) {
+    return res.status(400).json({
+      error: "Ce flux ne semble pas lié à la santé. Seules les sources médicales sont autorisées.",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      "INSERT INTO user_feeds (user_id, url, name) VALUES ($1, $2, $3) RETURNING *",
+      [req.user.id, rssUrl, name || null]
+    );
+    return res.json(result.rows[0]);
+  } catch {
+    return res.status(400).json({ error: "Ce flux existe déjà dans vos sources" });
+  }
+});
+
+app.delete("/user-feeds/:id", authMiddleware, async (req, res) => {
+  const result = await pool.query(
+    "DELETE FROM user_feeds WHERE id = $1 AND user_id = $2 RETURNING id",
+    [req.params.id, req.user.id]
+  );
+  if (result.rows.length === 0) {
+    return res.status(403).json({ error: "Non autorisé ou flux introuvable" });
+  }
+  res.json({ message: "Supprimé" });
+});
+
+/* =============================
    ARTICLES
+   Articles des flux globaux + articles des flux personnels du user
 ============================= */
 app.get("/articles/active", authMiddleware, async (req, res) => {
-  const result = await pool.query(`
-    SELECT DISTINCT a.*, f.name AS source, f.url AS feed_url
-    FROM articles a
-    JOIN feeds f ON a.feed_id = f.id
-    JOIN article_themes art ON a.id = art.article_id
-    JOIN user_active_themes uat ON art.theme_id = uat.theme_id
-    WHERE uat.user_id = $1
-    ORDER BY a.pub_date DESC
-    LIMIT 100
-  `, [req.user.id]);
-  res.json(result.rows);
+  try {
+    // Articles des flux globaux filtrés par thèmes actifs du user
+    const globalArticles = await pool.query(`
+      SELECT DISTINCT a.*, f.name AS source, f.url AS feed_url, 'global' as feed_type
+      FROM articles a
+      JOIN feeds f ON a.feed_id = f.id
+      JOIN article_themes art ON a.id = art.article_id
+      JOIN user_active_themes uat ON art.theme_id = uat.theme_id
+      WHERE uat.user_id = $1
+      ORDER BY a.pub_date DESC
+      LIMIT 100
+    `, [req.user.id]);
+
+    // Articles des flux personnels du user filtrés par ses thèmes actifs
+    const personalArticles = await pool.query(`
+      SELECT DISTINCT a.*, uf.name AS source, uf.url AS feed_url, 'personal' as feed_type
+      FROM user_articles a
+      JOIN user_feeds uf ON a.user_feed_id = uf.id
+      JOIN user_article_themes uat_art ON a.id = uat_art.article_id
+      JOIN user_active_themes uat ON uat_art.theme_id = uat.theme_id
+      WHERE uf.user_id = $1 AND uat.user_id = $1
+      ORDER BY a.pub_date DESC
+      LIMIT 100
+    `, [req.user.id]);
+
+    // Fusion et tri par date
+    const all = [...globalArticles.rows, ...personalArticles.rows]
+      .sort((a, b) => new Date(b.pub_date) - new Date(a.pub_date))
+      .slice(0, 100);
+
+    res.json(all);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Erreur serveur" });
+  }
 });
 
 app.get("/articles/new", authMiddleware, async (req, res) => {
   const { since } = req.query;
+  const sinceDate = since || new Date(Date.now() - 60 * 60 * 1000);
   try {
-    const result = await pool.query(`
-      SELECT DISTINCT a.*, f.name AS source, f.url AS feed_url
+    const globalArticles = await pool.query(`
+      SELECT DISTINCT a.*, f.name AS source, f.url AS feed_url, 'global' as feed_type
       FROM articles a
       JOIN feeds f ON a.feed_id = f.id
       JOIN article_themes art ON a.id = art.article_id
       JOIN user_active_themes uat ON art.theme_id = uat.theme_id
       WHERE uat.user_id = $1 AND a.created_at > $2
       ORDER BY a.pub_date DESC
-    `, [req.user.id, since || new Date(Date.now() - 60 * 60 * 1000)]);
-    res.json(result.rows);
+    `, [req.user.id, sinceDate]);
+
+    const personalArticles = await pool.query(`
+      SELECT DISTINCT a.*, uf.name AS source, uf.url AS feed_url, 'personal' as feed_type
+      FROM user_articles a
+      JOIN user_feeds uf ON a.user_feed_id = uf.id
+      JOIN user_article_themes uat_art ON a.id = uat_art.article_id
+      JOIN user_active_themes uat ON uat_art.theme_id = uat.theme_id
+      WHERE uf.user_id = $1 AND uat.user_id = $1 AND a.created_at > $2
+      ORDER BY a.pub_date DESC
+    `, [req.user.id, sinceDate]);
+
+    const all = [...globalArticles.rows, ...personalArticles.rows]
+      .sort((a, b) => new Date(b.pub_date) - new Date(a.pub_date));
+
+    res.json(all);
   } catch {
     res.status(500).json({ error: "Erreur serveur" });
   }
@@ -478,7 +602,6 @@ app.delete("/saved/:id", authMiddleware, async (req, res) => {
 /* =============================
    ADMIN
 ============================= */
-// Lister tous les users
 app.get("/admin/users", authMiddleware, adminMiddleware, async (req, res) => {
   const result = await pool.query(
     "SELECT id, email, name, role, created_at, is_active FROM users ORDER BY created_at DESC"
@@ -486,7 +609,6 @@ app.get("/admin/users", authMiddleware, adminMiddleware, async (req, res) => {
   res.json(result.rows);
 });
 
-// Activer/désactiver un user
 app.patch("/admin/users/:id/toggle", authMiddleware, adminMiddleware, async (req, res) => {
   const result = await pool.query(
     "UPDATE users SET is_active = NOT is_active WHERE id = $1 RETURNING id, email, is_active",
@@ -495,7 +617,6 @@ app.patch("/admin/users/:id/toggle", authMiddleware, adminMiddleware, async (req
   res.json(result.rows[0]);
 });
 
-// Changer le rôle d'un user
 app.patch("/admin/users/:id/role", authMiddleware, adminMiddleware, async (req, res) => {
   const { role } = req.body;
   if (!["user", "admin"].includes(role)) return res.status(400).json({ error: "Rôle invalide" });
@@ -506,7 +627,23 @@ app.patch("/admin/users/:id/role", authMiddleware, adminMiddleware, async (req, 
   res.json(result.rows[0]);
 });
 
-// Flux en attente
+// Voir tous les flux globaux
+app.get("/admin/feeds", authMiddleware, adminMiddleware, async (req, res) => {
+  const result = await pool.query("SELECT * FROM feeds ORDER BY id DESC");
+  res.json(result.rows);
+});
+
+// Voir tous les flux personnels de tous les users
+app.get("/admin/user-feeds", authMiddleware, adminMiddleware, async (req, res) => {
+  const result = await pool.query(`
+    SELECT uf.*, u.email as owner_email
+    FROM user_feeds uf
+    JOIN users u ON uf.user_id = u.id
+    ORDER BY uf.id DESC
+  `);
+  res.json(result.rows);
+});
+
 app.get("/admin/feeds/pending", authMiddleware, adminMiddleware, async (req, res) => {
   const result = await pool.query(`
     SELECT pf.*, u.email as submitted_by_email
@@ -518,7 +655,6 @@ app.get("/admin/feeds/pending", authMiddleware, adminMiddleware, async (req, res
   res.json(result.rows);
 });
 
-// Approuver un flux
 app.patch("/admin/feeds/:id/approve", authMiddleware, adminMiddleware, async (req, res) => {
   const feed = await pool.query("SELECT * FROM pending_feeds WHERE id = $1", [req.params.id]);
   if (!feed.rows[0]) return res.status(404).json({ error: "Flux introuvable" });
@@ -533,7 +669,6 @@ app.patch("/admin/feeds/:id/approve", authMiddleware, adminMiddleware, async (re
   res.json({ message: "Flux approuvé" });
 });
 
-// Rejeter un flux
 app.patch("/admin/feeds/:id/reject", authMiddleware, adminMiddleware, async (req, res) => {
   await pool.query(
     "UPDATE pending_feeds SET status = 'rejected', reviewed_by = $1 WHERE id = $2",
@@ -542,7 +677,6 @@ app.patch("/admin/feeds/:id/reject", authMiddleware, adminMiddleware, async (req
   res.json({ message: "Flux rejeté" });
 });
 
-// Ajouter un domaine approuvé
 app.post("/admin/domains", authMiddleware, adminMiddleware, async (req, res) => {
   const { domain } = req.body;
   try {
@@ -556,31 +690,30 @@ app.post("/admin/domains", authMiddleware, adminMiddleware, async (req, res) => 
   }
 });
 
-// Lister les domaines approuvés
 app.get("/admin/domains", authMiddleware, adminMiddleware, async (req, res) => {
   const result = await pool.query("SELECT * FROM approved_domains ORDER BY created_at DESC");
   res.json(result.rows);
 });
 
-// Supprimer un domaine
 app.delete("/admin/domains/:id", authMiddleware, adminMiddleware, async (req, res) => {
   await pool.query("DELETE FROM approved_domains WHERE id = $1", [req.params.id]);
   res.json({ message: "Supprimé" });
 });
 
-// Stats globales
 app.get("/admin/stats", authMiddleware, adminMiddleware, async (req, res) => {
-  const users = await pool.query("SELECT COUNT(*) FROM users");
-  const articles = await pool.query("SELECT COUNT(*) FROM articles");
-  const feeds = await pool.query("SELECT COUNT(*) FROM feeds");
-  const pending = await pool.query("SELECT COUNT(*) FROM pending_feeds WHERE status = 'pending'");
-  const themes = await pool.query("SELECT COUNT(*) FROM themes");
+  const users      = await pool.query("SELECT COUNT(*) FROM users");
+  const articles   = await pool.query("SELECT COUNT(*) FROM articles");
+  const feeds      = await pool.query("SELECT COUNT(*) FROM feeds");
+  const userFeeds  = await pool.query("SELECT COUNT(*) FROM user_feeds");
+  const pending    = await pool.query("SELECT COUNT(*) FROM pending_feeds WHERE status = 'pending'");
+  const themes     = await pool.query("SELECT COUNT(*) FROM themes");
   res.json({
-    users: parseInt(users.rows[0].count),
-    articles: parseInt(articles.rows[0].count),
-    feeds: parseInt(feeds.rows[0].count),
+    users:         parseInt(users.rows[0].count),
+    articles:      parseInt(articles.rows[0].count),
+    feeds:         parseInt(feeds.rows[0].count),
+    user_feeds:    parseInt(userFeeds.rows[0].count),
     pending_feeds: parseInt(pending.rows[0].count),
-    themes: parseInt(themes.rows[0].count),
+    themes:        parseInt(themes.rows[0].count),
   });
 });
 
