@@ -298,15 +298,17 @@ app.get("/themes/all", authMiddleware, async (req, res) => {
 });
 
 /* =============================
-   ACTIVE THEMES (par user)
+   ACTIVE THEMES (par user) — ISOLÉS PAR USER
 ============================= */
 app.get("/active-themes", authMiddleware, async (req, res) => {
+  // Thèmes globaux actifs pour CE user
   const global = await pool.query(`
     SELECT t.*, 'global' as type FROM themes t
     JOIN user_active_themes uat ON t.id = uat.theme_id
     WHERE uat.user_id = $1 AND uat.theme_id IS NOT NULL
   `, [req.user.id]);
 
+  // Thèmes personnels actifs pour CE user
   const personal = await pool.query(`
     SELECT ut.*, 'personal' as type FROM user_themes ut
     JOIN user_active_themes uat ON ut.id = uat.user_theme_id
@@ -318,6 +320,18 @@ app.get("/active-themes", authMiddleware, async (req, res) => {
 
 app.post("/active-themes", authMiddleware, async (req, res) => {
   const { theme_id, user_theme_id } = req.body;
+
+  // Vérifier que le thème personnel appartient bien à ce user
+  if (user_theme_id) {
+    const check = await pool.query(
+      "SELECT id FROM user_themes WHERE id = $1 AND user_id = $2",
+      [user_theme_id, req.user.id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(403).json({ error: "Ce thème ne vous appartient pas" });
+    }
+  }
+
   try {
     await pool.query(
       `INSERT INTO user_active_themes (user_id, theme_id, user_theme_id)
@@ -326,38 +340,46 @@ app.post("/active-themes", authMiddleware, async (req, res) => {
     );
     res.json({ message: "Activé" });
   } catch {
-    res.status(400).json({ error: "Erreur" });
+    res.status(400).json({ error: "Erreur lors de l'activation" });
   }
 });
 
 app.delete("/active-themes/:theme_id", authMiddleware, async (req, res) => {
+  // Supprimer uniquement pour CE user (global ou personnel)
   await pool.query(
-    "DELETE FROM user_active_themes WHERE user_id = $1 AND (theme_id = $2 OR user_theme_id = $2)",
+    `DELETE FROM user_active_themes
+     WHERE user_id = $1 AND (theme_id = $2 OR user_theme_id = $2)`,
     [req.user.id, req.params.theme_id]
   );
   res.json({ message: "Désactivé" });
 });
 
 /* =============================
-   FEEDS
+   FEEDS — ISOLÉS PAR USER
 ============================= */
-app.get("/feeds", async (req, res) => {
-  const result = await pool.query("SELECT * FROM feeds ORDER BY id DESC");
+
+// Chaque user voit uniquement SES flux
+app.get("/feeds", authMiddleware, async (req, res) => {
+  const result = await pool.query(
+    "SELECT * FROM feeds WHERE user_id = $1 ORDER BY id DESC",
+    [req.user.id]
+  );
   res.json(result.rows);
 });
 
-// User soumet un flux → va dans pending
+// Ajouter un flux — associé au user connecté
 app.post("/feeds", authMiddleware, async (req, res) => {
   const { url, name } = req.body;
+
   const rssUrl = await detectRSS(url);
   if (!rssUrl) return res.status(400).json({ error: "Aucun flux RSS trouvé" });
 
-  // Si admin → ajout direct
+  // Admin → ajout direct sans vérification de contenu
   if (req.user.role === "admin") {
     try {
       const result = await pool.query(
-        "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
-        [rssUrl, name || null]
+        "INSERT INTO feeds (url, name, user_id) VALUES ($1, $2, $3) RETURNING *",
+        [rssUrl, name || null, req.user.id]
       );
       return res.json(result.rows[0]);
     } catch {
@@ -365,12 +387,12 @@ app.post("/feeds", authMiddleware, async (req, res) => {
     }
   }
 
-  // Si domaine whitelisté → ajout direct
+  // Domaine whitelisté → ajout direct
   if (await isDomainAllowed(rssUrl)) {
     try {
       const result = await pool.query(
-        "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
-        [rssUrl, name || null]
+        "INSERT INTO feeds (url, name, user_id) VALUES ($1, $2, $3) RETURNING *",
+        [rssUrl, name || null, req.user.id]
       );
       return res.json(result.rows[0]);
     } catch {
@@ -378,7 +400,7 @@ app.post("/feeds", authMiddleware, async (req, res) => {
     }
   }
 
-  // Sinon → validation contenu puis pending
+  // Domaine inconnu → vérification du contenu
   const isHealth = await isContentHealthRelated(rssUrl);
   if (!isHealth) {
     return res.status(400).json({
@@ -386,11 +408,11 @@ app.post("/feeds", authMiddleware, async (req, res) => {
     });
   }
 
-  // Contenu ok mais domaine inconnu → pending
+  // Contenu santé validé → ajout
   try {
     const result = await pool.query(
-      "INSERT INTO feeds (url, name) VALUES ($1, $2) RETURNING *",
-      [rssUrl, name || null]
+      "INSERT INTO feeds (url, name, user_id) VALUES ($1, $2, $3) RETURNING *",
+      [rssUrl, name || null, req.user.id]
     );
     return res.json(result.rows[0]);
   } catch {
@@ -398,8 +420,24 @@ app.post("/feeds", authMiddleware, async (req, res) => {
   }
 });
 
-app.delete("/feeds/:id", authMiddleware, adminMiddleware, async (req, res) => {
-  await pool.query("DELETE FROM feeds WHERE id = $1", [req.params.id]);
+// Supprimer un flux — uniquement SES propres flux (admin peut tout supprimer)
+app.delete("/feeds/:id", authMiddleware, async (req, res) => {
+  let result;
+  if (req.user.role === "admin") {
+    result = await pool.query(
+      "DELETE FROM feeds WHERE id = $1 RETURNING id",
+      [req.params.id]
+    );
+  } else {
+    result = await pool.query(
+      "DELETE FROM feeds WHERE id = $1 AND user_id = $2 RETURNING id",
+      [req.params.id, req.user.id]
+    );
+  }
+
+  if (result.rows.length === 0) {
+    return res.status(403).json({ error: "Non autorisé ou flux introuvable" });
+  }
   res.json({ message: "Supprimé" });
 });
 
@@ -407,6 +445,7 @@ app.delete("/feeds/:id", authMiddleware, adminMiddleware, async (req, res) => {
    ARTICLES
 ============================= */
 app.get("/articles/active", authMiddleware, async (req, res) => {
+  // Articles liés aux thèmes ACTIFS de CE user (globaux + personnels)
   const result = await pool.query(`
     SELECT DISTINCT a.*, f.name AS source, f.url AS feed_url
     FROM articles a
@@ -475,6 +514,7 @@ app.delete("/saved/:id", authMiddleware, async (req, res) => {
 /* =============================
    ADMIN
 ============================= */
+
 // Lister tous les users
 app.get("/admin/users", authMiddleware, adminMiddleware, async (req, res) => {
   const result = await pool.query(
@@ -501,6 +541,17 @@ app.patch("/admin/users/:id/role", authMiddleware, adminMiddleware, async (req, 
     [role, req.params.id]
   );
   res.json(result.rows[0]);
+});
+
+// Voir tous les flux (admin uniquement)
+app.get("/admin/feeds", authMiddleware, adminMiddleware, async (req, res) => {
+  const result = await pool.query(`
+    SELECT f.*, u.email as owner_email
+    FROM feeds f
+    LEFT JOIN users u ON f.user_id = u.id
+    ORDER BY f.id DESC
+  `);
+  res.json(result.rows);
 });
 
 // Flux en attente
@@ -567,17 +618,17 @@ app.delete("/admin/domains/:id", authMiddleware, adminMiddleware, async (req, re
 
 // Stats globales
 app.get("/admin/stats", authMiddleware, adminMiddleware, async (req, res) => {
-  const users = await pool.query("SELECT COUNT(*) FROM users");
+  const users    = await pool.query("SELECT COUNT(*) FROM users");
   const articles = await pool.query("SELECT COUNT(*) FROM articles");
-  const feeds = await pool.query("SELECT COUNT(*) FROM feeds");
-  const pending = await pool.query("SELECT COUNT(*) FROM pending_feeds WHERE status = 'pending'");
-  const themes = await pool.query("SELECT COUNT(*) FROM themes");
+  const feeds    = await pool.query("SELECT COUNT(*) FROM feeds");
+  const pending  = await pool.query("SELECT COUNT(*) FROM pending_feeds WHERE status = 'pending'");
+  const themes   = await pool.query("SELECT COUNT(*) FROM themes");
   res.json({
-    users: parseInt(users.rows[0].count),
-    articles: parseInt(articles.rows[0].count),
-    feeds: parseInt(feeds.rows[0].count),
+    users:         parseInt(users.rows[0].count),
+    articles:      parseInt(articles.rows[0].count),
+    feeds:         parseInt(feeds.rows[0].count),
     pending_feeds: parseInt(pending.rows[0].count),
-    themes: parseInt(themes.rows[0].count),
+    themes:        parseInt(themes.rows[0].count),
   });
 });
 
